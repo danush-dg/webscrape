@@ -1,0 +1,10 @@
+playwright
+playwright-stealth
+beautifulsoup4
+pandas
+tenacity
+openpyxl
+fastapi
+uvicorn[standard]
+python-multipart
+jinja2
