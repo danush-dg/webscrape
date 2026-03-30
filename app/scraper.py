@@ -1,734 +1,314 @@
-# import re
-# import pandas as pd
-# import os
-# import asyncio
-# import sys
-# from urllib.parse import urlparse
-# from playwright.async_api import async_playwright
-
-# # ✅ Windows fix
-# if sys.platform == "win32":
-#     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
-
-# BASE_URL = "https://sieportal.siemens.com/en-vn/products-services/detail/{}?tree=CatalogTree"
-# OUTPUT_FILE = "data/output/output.xlsx"
-# IMAGE_DIR = "data/images"
-
-
-# # -----------------------------
-# # COOKIE HANDLER
-# # -----------------------------
-# async def handle_cookie(page):
-#     try:
-#         # Try direct button (fastest)
-#         btn = page.get_by_role("button", name=re.compile("accept|agree|allow|ok", re.I))
-
-#         if await btn.count() > 0:
-#             await btn.first.click(timeout=2000)
-#             print("✅ Cookie accepted")
-#             return
-
-#     except:
-#         pass
-
-# # -----------------------------
-# # IMAGE DOWNLOAD (UPDATED)
-# # -----------------------------
-# async def download_image(page, part):
-#     os.makedirs(IMAGE_DIR, exist_ok=True)
-
-#     try:
-#         html = await page.content()
-
-#         # ✅ 1. OG IMAGE (best)
-#         img_url = None
-#         try:
-#             og = page.locator("meta[property='og:image']")
-#             if await og.count() > 0:
-#                 img_url = await og.first.get_attribute("content")
-#         except:
-#             pass
-
-#         # ✅ 2. JSON fallback
-#         if not img_url:
-#             match = re.search(r'"image":"(https://[^"]+)"', html)
-#             if match:
-#                 img_url = match.group(1)
-
-#         # ✅ 3. last fallback
-#         if not img_url:
-#             try:
-#                 img_url = await page.locator("img").first.get_attribute("src")
-#             except:
-#                 return ""
-
-#         if not img_url:
-#             return ""
-
-#         # Fix relative URL
-#         if img_url.startswith("/"):
-#             img_url = "https://sieportal.siemens.com" + img_url
-
-#         img_url = img_url.split("?")[0]
-
-#         # Extension
-#         ext = os.path.splitext(urlparse(img_url).path)[1]
-#         if ext.lower() not in [".jpg", ".jpeg", ".png", ".webp"]:
-#             ext = ".jpg"
-
-#         file_path = os.path.join(IMAGE_DIR, f"{part}_image{ext}")
-
-#         # ✅ Download image
-#         response = await page.context.request.get(img_url)
-
-#         if response.ok:
-#             with open(file_path, "wb") as f:
-#                 f.write(await response.body())
-
-#             print(f"🖼️ Saved: {file_path}")
-
-#         # ✅ RETURN URL (IMPORTANT)
-#         return img_url
-
-#     except Exception as e:
-#         print(f"⚠️ Image error for {part}: {e}")
-
-#     return ""
-
-
-# # -----------------------------
-# # HELPER
-# # -----------------------------
-# def extract(text, label):
-#     pattern = rf"{label}\s+(.*?)\n"
-#     match = re.search(pattern, text, re.IGNORECASE)
-#     return match.group(1).strip() if match else None
-
-
-# # -----------------------------
-# # SCRAPE ONE PART
-# # -----------------------------
-# async def scrape_part(page, part):
-#     url = BASE_URL.format(part)
-
-#     data = {
-#         "Part Number": part,
-#         "Article Number": None,
-#         "Description": None,
-#         "Family": None,
-#         "Lifecycle": None,
-#         "PLM Date": None,
-#         "Image": None,
-#         "URL": url,
-#         "Status": "Success"
-#     }
-
-#     try:
-#         await page.goto(url, timeout=60000)
-
-#         await handle_cookie(page)
-
-#         await page.wait_for_timeout(2000)
-
-#         print("🌐 Current URL:", page.url)
-
-#         # ❌ Search page → skip
-#         if "search" in page.url:
-#             data["Status"] = "No Data"
-#             return data
-
-#         try:
-#             await page.wait_for_selector("h1.intro-section__content-headline", timeout=5000)
-#         except:
-#             data["Status"] = "No Data / Timeout"
-#             return data
-
-#         await page.mouse.wheel(0, 1500)
-
-#         content = await page.locator("body").text_content() or ""
-
-#         if "no results" in content.lower() or "not found" in content.lower():
-#             data["Status"] = "No Data Found"
-#             return data
-
-#         # -----------------------------
-#         # EXTRACTION
-#         # -----------------------------
-
-#         match = re.search(r"Article number\s+([A-Z0-9\-]+)", content)
-#         data["Article Number"] = (
-#             match.group(1) if match else await page.locator("h1.intro-section__content-headline").first.inner_text()
-#         )
-
-#         # ✅ UPDATED IMAGE LOGIC
-#         data["Image"] = await download_image(page, part)
-
-#         try:
-#             label = page.locator("text=Product Family").first
-#             link = label.locator("xpath=following::a[1]")
-#             data["Family"] = await link.inner_text()
-#         except:
-#             pass
-
-#         data["Lifecycle"] = (
-#             extract(content, "Product lifecycle")
-#             or extract(content, "Life cycle status")
-#         )
-
-#         match = re.search(r"Since:\s*(\d{2}\.\d{2}\.\d{4})", content)
-#         data["PLM Date"] = match.group(1) if match else None
-
-#         match = re.search(r"Device:\s*(.*?)(\n|$)", content)
-#         if match:
-#             desc = match.group(1)
-#             desc = re.sub(r"\s+", " ", desc).strip()
-#             desc = desc.replace("|", ";")
-#             desc = re.sub(r";+", ";", desc)
-#             data["Description"] = desc
-
-#     except Exception as e:
-#         data["Status"] = f"Error: {e}"
-
-#     return data
-
-
-# # -----------------------------
-# # MAIN FUNCTION
-# # -----------------------------
-# async def scrape(csv_path):
-#     parts = pd.read_csv(csv_path).iloc[:, 0].dropna().tolist()
-
-#     results = []
-#     os.makedirs("data/output", exist_ok=True)
-
-#     async with async_playwright() as p:
-#         browser = await p.chromium.launch(headless=False)
-#         page = await browser.new_page()
-
-#         await page.goto(BASE_URL.format(parts[0]))
-#         await handle_cookie(page)
-
-#         for part in parts:
-#             print(f"🔍 Scraping {part}")
-#             data = await scrape_part(page, part)
-#             results.append(data)
-
-#         await browser.close()
-
-#     pd.DataFrame(results).to_excel(OUTPUT_FILE, index=False)
-#     print(f"✅ Done → {OUTPUT_FILE}")
-
-
-#2
-# import re
-# import pandas as pd
-# import os
-# import asyncio
-# import sys
-# from urllib.parse import urlparse
-# from playwright.async_api import async_playwright
-
-# # ✅ Windows fix
-# if sys.platform == "win32":
-#     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
-
-# BASE_URL = "https://sieportal.siemens.com/en-vn/products-services/detail/{}?tree=CatalogTree"
-# OUTPUT_FILE = "data/output/output.xlsx"
-# IMAGE_DIR = "data/images"
-
-
-# # -----------------------------
-# # CLEAN TEXT
-# # -----------------------------
-# def clean_text(text):
-#     text = re.sub(r"<.*?>", " ", text)
-#     text = re.sub(r"\s+", " ", text)
-#     text = text.replace("|", ";")
-#     text = re.sub(r";+", ";", text)
-#     return text.strip()
-
-
-# # -----------------------------
-# # DESCRIPTION EXTRACTION
-# # -----------------------------
-# def extract_description(html):
-#     match = re.search(
-#         r"Product description[:\s]*(.*?)(?:</p>|</div>|\n[A-Z])",
-#         html,
-#         re.IGNORECASE | re.DOTALL
-#     )
-#     if match:
-#         return clean_text(match.group(1))
-
-#     match = re.search(
-#         r"Device:\s*(.*?)(\n|$)",
-#         html,
-#         re.IGNORECASE
-#     )
-#     if match:
-#         return clean_text(match.group(1))
-
-#     match = re.search(r'"description":"(.*?)"', html)
-#     if match:
-#         return clean_text(match.group(1))
-
-#     return None
-
-
-# # -----------------------------
-# # COOKIE HANDLER
-# # -----------------------------
-# async def handle_cookie(page):
-#     try:
-#         btn = page.get_by_role("button", name=re.compile("accept|agree|allow|ok", re.I))
-
-#         if await btn.count() > 0:
-#             await btn.first.click(timeout=2000)
-#             print("✅ Cookie accepted")
-#             return
-
-#     except:
-#         pass
-
-
-# # -----------------------------
-# # IMAGE DOWNLOAD (UPDATED)
-# # -----------------------------
-# async def download_image(page, part):
-#     os.makedirs(IMAGE_DIR, exist_ok=True)
-
-#     try:
-#         html = await page.content()
-
-#         img_url = None
-
-#         try:
-#             og = page.locator("meta[property='og:image']")
-#             if await og.count() > 0:
-#                 img_url = await og.first.get_attribute("content")
-#         except:
-#             pass
-
-#         if not img_url:
-#             match = re.search(r'"image":"(https://[^"]+)"', html)
-#             if match:
-#                 img_url = match.group(1)
-
-#         if not img_url:
-#             try:
-#                 img_url = await page.locator("img").first.get_attribute("src")
-#             except:
-#                 return ""
-
-#         if not img_url:
-#             return ""
-
-#         if img_url.startswith("/"):
-#             img_url = "https://sieportal.siemens.com" + img_url
-
-#         img_url = img_url.split("?")[0]
-
-#         ext = os.path.splitext(urlparse(img_url).path)[1]
-#         if ext.lower() not in [".jpg", ".jpeg", ".png", ".webp"]:
-#             ext = ".jpg"
-
-#         file_path = os.path.join(IMAGE_DIR, f"{part}_image{ext}")
-
-#         response = await page.context.request.get(img_url)
-
-#         if response.ok:
-#             with open(file_path, "wb") as f:
-#                 f.write(await response.body())
-
-#             print(f"🖼️ Saved: {file_path}")
-
-#         return img_url
-
-#     except Exception as e:
-#         print(f"⚠️ Image error for {part}: {e}")
-
-#     return ""
-
-
-# # -----------------------------
-# # HELPER
-# # -----------------------------
-# def extract(text, label):
-#     pattern = rf"{label}\s+(.*?)\n"
-#     match = re.search(pattern, text, re.IGNORECASE)
-#     return match.group(1).strip() if match else None
-
-
-# # -----------------------------
-# # SCRAPE ONE PART
-# # -----------------------------
-# async def scrape_part(page, part):
-#     url = BASE_URL.format(part)
-
-#     data = {
-#         "Part Number": part,
-#         "Article Number": None,
-#         "Description": None,
-#         "Family": None,
-#         "Lifecycle": None,
-#         "PLM Date": None,
-#         "Image": None,
-#         "URL": url,
-#         "Status": "Success"
-#     }
-
-#     try:
-#         await page.goto(url, timeout=60000)
-
-#         await handle_cookie(page)
-
-#         await page.wait_for_timeout(2000)
-
-#         print("🌐 Current URL:", page.url)
-
-#         if "search" in page.url:
-#             data["Status"] = "No Data"
-#             return data
-
-#         try:
-#             await page.wait_for_selector("h1.intro-section__content-headline", timeout=5000)
-#         except:
-#             data["Status"] = "No Data / Timeout"
-#             return data
-
-#         await page.mouse.wheel(0, 1500)
-
-#         content = await page.locator("body").text_content() or ""
-#         html = await page.content()
-
-#         if "no results" in content.lower() or "not found" in content.lower():
-#             data["Status"] = "No Data Found"
-#             return data
-
-#         # -----------------------------
-#         # EXTRACTION
-#         # -----------------------------
-
-#         match = re.search(r"Article number\s+([A-Z0-9\-]+)", content)
-#         data["Article Number"] = (
-#             match.group(1) if match else await page.locator("h1.intro-section__content-headline").first.inner_text()
-#         )
-
-#         # ✅ ONLY CHANGE HERE
-#         desc = extract_description(html) or extract_description(content)
-#         if desc:
-#             data["Description"] = desc
-
-#         data["Image"] = await download_image(page, part)
-
-#         try:
-#             label = page.locator("text=Product Family").first
-#             link = label.locator("xpath=following::a[1]")
-#             data["Family"] = await link.inner_text()
-#         except:
-#             pass
-
-#         data["Lifecycle"] = (
-#             extract(content, "Product lifecycle")
-#             or extract(content, "Life cycle status")
-#         )
-
-#         match = re.search(r"Since:\s*(\d{2}\.\d{2}\.\d{4})", content)
-#         data["PLM Date"] = match.group(1) if match else None
-
-#     except Exception as e:
-#         data["Status"] = f"Error: {e}"
-
-#     return data
-
-
-# # -----------------------------
-# # MAIN FUNCTION
-# # -----------------------------
-# async def scrape(csv_path):
-#     parts = pd.read_csv(csv_path).iloc[:, 0].dropna().tolist()
-
-#     results = []
-#     os.makedirs("data/output", exist_ok=True)
-
-#     async with async_playwright() as p:
-#         browser = await p.chromium.launch(headless=False)
-#         page = await browser.new_page()
-
-#         await page.goto(BASE_URL.format(parts[0]))
-#         await handle_cookie(page)
-
-#         for part in parts:
-#             print(f"🔍 Scraping {part}")
-#             data = await scrape_part(page, part)
-#             results.append(data)
-
-#         await browser.close()
-
-#     pd.DataFrame(results).to_excel(OUTPUT_FILE, index=False)
-#     print(f"✅ Done → {OUTPUT_FILE}")
-
-
 
 import re
 import pandas as pd
 import os
 import asyncio
 import sys
-import logging
-from urllib.parse import urlparse
-from playwright.async_api import async_playwright
+import json
+import random
+from urllib.parse import urlparse, quote
+from playwright.async_api import async_playwright, Page
 from bs4 import BeautifulSoup
 from tenacity import retry, stop_after_attempt, wait_fixed
+from app.logger import setup_logger
 
-# Windows fix
-if sys.platform == "win32":
-    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+SEM = asyncio.Semaphore(3)  # reduced to avoid race issues
+BATCH_SIZE = 20
 
-BASE_URL = "https://mall.industry.siemens.com/mall/en/vn/Catalog/Product/{}"
+SEARCH_URL = "https://sieportal.siemens.com/en-vn/search?scope=catalog&Type=products&SearchTerm={}&CatalogSearchSettings.Limit=20&CatalogSearchSettings.Index=0&SortingOption=Relevance"
+DETAIL_BASE_URL = "https://sieportal.siemens.com/en-vn/products-services/detail/{}"
+
 OUTPUT_FILE = "data/output/output.xlsx"
 IMAGE_DIR = "data/images"
-LOG_FILE = "logs/scraper.log"
 
 os.makedirs("data/output", exist_ok=True)
 os.makedirs("logs", exist_ok=True)
 os.makedirs(IMAGE_DIR, exist_ok=True)
 
-logging.basicConfig(
-    filename=LOG_FILE,
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s"
-)
+logger = setup_logger()
 
-# -----------------------------
-# COOKIE HANDLER
-# -----------------------------
-async def handle_cookie(page):
-    for _ in range(3):
-        try:
-            btn = page.get_by_role("button", name=re.compile("accept|agree|allow|ok", re.I))
-            if await btn.count() > 0:
-                await btn.first.click(timeout=2000)
-                logging.info("Cookie accepted")
-                return
-        except:
-            await page.wait_for_timeout(1000)
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
-# -----------------------------
-# CLEAN TEXT
-# -----------------------------
+# =========================
+# UTILITIES
+# =========================
+
 def clean_text(text):
-    return re.sub(r"\s+", " ", text).strip()
+    return re.sub(r"\s+", " ", text).strip() if text else None
 
-# -----------------------------
-# BEAUTIFULSOUP PARSER
-# -----------------------------
+
+def normalize_weight(weight):
+    if not weight:
+        return None
+    weight = weight.replace(",", ".")
+    match = re.findall(r"\d+\.?\d*", weight)
+    return float(match[0]) if match else None
+
+
+def is_valid_data(data):
+    return any([
+        data.get("Description"),
+        data.get("Lifecycle Status"),
+        data.get("Notes")
+    ])
+
+
+async def handle_cookie(page):
+    try:
+        btn = page.get_by_role("button", name=re.compile("accept|agree|allow|ok|close", re.I))
+        if await btn.count() > 0:
+            await btn.first.click(timeout=2000)
+    except:
+        pass
+
+# =========================
+# PAGE LOAD
+# =========================
+
+async def stable_load(page, url, part_number=None):
+    await page.goto(url, timeout=60000, wait_until="domcontentloaded")
+
+    try:
+        await page.wait_for_selector("h1", timeout=15000)
+        await page.wait_for_load_state("networkidle")
+        await page.wait_for_timeout(2000)
+    except:
+        logger.warning(f"{part_number}: page not stable")
+
+# =========================
+# PARSER (HYBRID)
+# =========================
+
 def parse_html(html):
     soup = BeautifulSoup(html, "html.parser")
+    text = soup.get_text(" ", strip=True)
 
     data = {
         "Description": None,
         "Notes": None,
-        "Lifecycle Status": None
+        "Lifecycle Status": None,
+        "Standard Delivery Time": None,
+        "Net Weight (kg)": None,
+        "Minimum Order Quantity": None,
+        "Country of Origin": None
     }
 
-    # -----------------------------
-    # DESCRIPTION
-    # -----------------------------
+    # META
     meta = soup.select_one("meta[name='description']")
     if meta and meta.get("content"):
         data["Description"] = clean_text(meta.get("content"))
 
-    # -----------------------------
-    # FULL TEXT (for fallback parsing)
-    # -----------------------------
-    text = soup.get_text(" ", strip=True)
+    # DOM fallback
+    if not data["Description"]:
+        desc = soup.select_one("div.product-description")
+        if desc:
+            data["Description"] = clean_text(desc.text)
 
-    # -----------------------------
-    # NOTES (clean extraction)
-    # -----------------------------
-    notes_match = re.search(
-        r"Notes[:\s]*(.*?)(?:Product family|Life cycle|$)",
-        text,
-        re.I
-    )
-    if notes_match:
-        data["Notes"] = clean_text(notes_match.group(1))
-
-    # -----------------------------
-    # LIFECYCLE STATUS (IMPORTANT)
-    # -----------------------------
+    # REGEX (robust)
     lifecycle_match = re.search(
-        r"Life cycle status[:\s]*(.*?)(?:\||Product|$)",
-        text,
-        re.I
+        r"(?:Life cycle|Lifecycle)\s*(?:status)?[:\s]*(.*?)(?:\||Product|Download|$)",
+        text, re.I
     )
     if lifecycle_match:
         data["Lifecycle Status"] = clean_text(lifecycle_match.group(1))
 
+    notes_match = re.search(
+        r"Notes[:\s]*(.*?)(?:Product family|Life cycle|$)",
+        text, re.I
+    )
+    if notes_match:
+        data["Notes"] = clean_text(notes_match.group(1))
+
+    weight_match = re.search(r"Weight[^\d]*([\d\.,]+)", text, re.I)
+    if weight_match:
+        data["Net Weight (kg)"] = normalize_weight(weight_match.group(1))
+
     return data
 
-# -----------------------------
-# IMAGE DOWNLOAD
-# -----------------------------
-async def download_image(page, part):
+# =========================
+# VARIANT FINDER
+# =========================
+
+async def find_variants(page, parent_part):
+    variants = set()
+
     try:
+        url = SEARCH_URL.format(quote(parent_part))
+        await stable_load(page, url, parent_part)
+        await handle_cookie(page)
+
         html = await page.content()
+        soup = BeautifulSoup(html, "html.parser")
 
-        match = re.search(r'"image":"(https://[^"]+)"', html)
-        if not match:
-            return ""
+        links = soup.find_all("a", href=re.compile(r"/detail/"))
 
-        img_url = match.group(1).split("?")[0]
+        for link in links:
+            match = re.search(r"/detail/([A-Z0-9\-]+)$", link.get("href", ""))
+            if match:
+                part = match.group(1)
+                if part.startswith(parent_part):
+                    variants.add(part)
 
-        ext = os.path.splitext(urlparse(img_url).path)[1] or ".jpg"
-        file_path = os.path.join(IMAGE_DIR, f"{part}_image{ext}")
+        if not variants:
+            variants.add(parent_part)
 
-        response = await page.context.request.get(img_url)
-        if response.ok:
-            with open(file_path, "wb") as f:
-                f.write(await response.body())
-
-        return img_url
+        return list(set(variants))
 
     except Exception as e:
-        logging.error(f"Image error {part}: {e}")
-        return ""
+        logger.error(f"Variant error: {e}")
+        return [parent_part]
 
-# -----------------------------
-# RETRY LOAD
-# -----------------------------
-@retry(stop=stop_after_attempt(3), wait=wait_fixed(2))
-async def load_page(page, url):
-    await page.goto(url, timeout=60000)
-    await page.wait_for_timeout(3000)
+# =========================
+# IMAGE
+# =========================
 
-# -----------------------------
-# PRODUCT LINKS
-# -----------------------------
-async def get_product_links(page):
-    return [page.url]
+async def extract_image(page, part_number):
+    try:
+        await page.wait_for_selector("img", timeout=10000)
 
-# -----------------------------
-# SCRAPE SINGLE
-# -----------------------------
-async def scrape_single(page, url, part):
+        # Strategy 1: og:image
+        og = page.locator("meta[property='og:image']")
+        if await og.count() > 0:
+            url = await og.first.get_attribute("content")
+            if url:
+                return url
+
+        # Strategy 2: main product image (IMPORTANT)
+        product_img = page.locator("img[src*='product'], img[src*='catalog']")
+        if await product_img.count() > 0:
+            src = await product_img.first.get_attribute("src")
+            if src:
+                return src
+
+        # Strategy 3: fallback (first valid large image)
+        imgs = page.locator("img")
+        count = await imgs.count()
+
+        for i in range(count):
+            src = await imgs.nth(i).get_attribute("src")
+            if src and "logo" not in src.lower() and len(src) > 50:
+                return src
+
+    except Exception as e:
+        logger.warning(f"{part_number}: Image error {e}")
+
+    return None
+# =========================
+# SCRAPER
+# =========================
+
+async def scrape_product(page, part_number, parent_part=None):
     data = {
-        "Part Number": part,
+        "Parent Part": parent_part or part_number,
+        "Part Number": part_number,
         "Article Number": None,
         "Description": None,
         "Notes": None,
-        "Notes": None,
         "Lifecycle Status": None,
+        "Net Weight (kg)": None,
         "Image": None,
-        "URL": url,
         "Status": "Success"
     }
 
+    url = DETAIL_BASE_URL.format(part_number)
+
     try:
-        await load_page(page, url)
+        await stable_load(page, url, part_number)
         await handle_cookie(page)
-
-        # Redirect check
-        if "search" in page.url.lower():
-            data["URL"] = page.url
-            data["Status"] = "Redirected to Search"
-            return data
-
-        await page.wait_for_selector("h1", timeout=10000)
 
         html = await page.content()
 
-        # Description & Notes
+        if "captcha" in html.lower() or "access denied" in html.lower():
+            data["Status"] = "Blocked"
+            return data
+
+        if len(html) < 1000:
+            data["Status"] = "Empty Page"
+            return data
+
         parsed = parse_html(html)
-        data["Description"] = parsed["Description"]
-        data["Notes"] = parsed["Notes"]
-        data["Lifecycle Status"] = parsed["Lifecycle Status"]
 
-        # Article Number
+        # 🔁 retry if missing
+        if not is_valid_data(parsed):
+            logger.warning(f"{part_number}: retry due to missing data")
+            await page.reload()
+            await page.wait_for_timeout(3000)
+            html = await page.content()
+            parsed = parse_html(html)
+
+        data.update(parsed)
+
+        # Article number
         headings = page.locator("h1")
-        count = await headings.count()
-
-        for i in range(count):
-            text = (await headings.nth(i).inner_text()).strip()
-            if re.match(r"[A-Z0-9\-]{6,}", text):
-                data["Article Number"] = text
-                break
+        if await headings.count() > 0:
+            data["Article Number"] = (await headings.first.inner_text()).strip()
 
         # Image
-        try:
-            img_url = None
+        data["Image"] = await extract_image(page, part_number)
 
-            og = page.locator("meta[property='og:image']")
-            if await og.count() > 0:
-                img_url = await og.first.get_attribute("content")
+        if not is_valid_data(parsed):
+            data["Status"] = "Partial Data"
 
-            if not img_url:
-                img = page.locator("img")
-                if await img.count() > 0:
-                    img_url = await img.first.get_attribute("src")
+        logger.info(json.dumps({"event": "scraped", "part": part_number}))
 
-            if img_url:
-                if img_url.startswith("/"):
-                    img_url = "https://mall.industry.siemens.com" + img_url
-
-                img_url = img_url.split("?")[0]
-
-                ext = os.path.splitext(urlparse(img_url).path)[1] or ".jpg"
-                file_path = os.path.join(IMAGE_DIR, f"{part}_image{ext}")
-
-                response = await page.context.request.get(img_url)
-                if response.ok:
-                    with open(file_path, "wb") as f:
-                        f.write(await response.body())
-
-                data["Image"] = img_url
-
-        except Exception as e:
-            logging.error(f"Image error {part}: {e}")
-
-        # Final validation
-        if not data["Article Number"]:
-            data["Description"] = None
-            data["Notes"] = None
-            data["Notes"] = None
-            data["Lifecycle Status"] = None
-            data["Image"] = None
-            data["Status"] = "No Article Number"
-
+    except asyncio.TimeoutError:
+        data["Status"] = "Timeout"
     except Exception as e:
-        logging.error(f"Error {part}: {e}")
-        data["Status"] = "Error"
+        data["Status"] = f"Error: {str(e)[:50]}"
+        logger.exception(e)
 
     return data
 
-# -----------------------------
+
+async def scrape_product_parallel(browser, part, parent):
+    async with SEM:
+        page = await browser.new_page()
+        try:
+            return await scrape_product(page, part, parent)
+        finally:
+            await page.close()
+
+# =========================
 # MAIN
-# -----------------------------
+# =========================
+
 async def scrape(csv_path):
     parts = pd.read_csv(csv_path).iloc[:, 0].dropna().tolist()
+
     results = []
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=False)
-        page = await browser.new_page()
 
-        for part in parts:
-            try:
-                url = BASE_URL.format(part)
-                logging.info(f"Scraping {part}")
+        context = await browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+        )
 
-                links = [url]
+        page = await context.new_page()
 
-                for link in links:
-                    data = await scrape_single(page, link, part)
-                    results.append(data)
+        for parent in parts:
+            variants = await find_variants(page, parent)
 
-            except Exception as e:
-                logging.error(f"Failed {part}: {e}")
+            for i in range(0, len(variants), BATCH_SIZE):
+                batch = variants[i:i+BATCH_SIZE]
+
+                tasks = [scrape_product_parallel(browser, v, parent) for v in batch]
+                batch_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+                for r in batch_results:
+                    if isinstance(r, dict):
+                        results.append(r)
 
         await browser.close()
 
-    pd.DataFrame(results).to_excel(OUTPUT_FILE, index=False)
-    logging.info("Scraping completed")
-    print(f"✅ Done → {OUTPUT_FILE}")
+    if results:
+        df = pd.DataFrame(results)
+        try:
+            df.to_excel(OUTPUT_FILE, index=False)
+        except PermissionError:
+            logger.error("Close Excel file and retry")
+
+
+if __name__ == "__main__":
+    asyncio.run(scrape("data/input/products.csv"))
