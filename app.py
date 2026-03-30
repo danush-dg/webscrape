@@ -34,5 +34,5 @@ if uploaded_file:
             df = pd.read_excel(output_file)
             st.dataframe(df)
 
-            with open(output_file, "rb") as f:
+            with open(output_file, "rb") as f: 
                 st.download_button("Download Excel", f, "output.xlsx")
